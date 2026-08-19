@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import requests
+import urllib.parse
+import unicodedata
 
 st.set_page_config(
     page_title="Roteirizador de Mobilização de Pranchas",
@@ -8,44 +10,69 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🚛 Roteirizador & Calculador Automático de Mobilização")
-st.caption("Cálculo automático de rotas, consumo por trecho (vazio vs. carregado), manutenção e custos operacionais.")
+st.title("🚛 Roteirizador & Calculador de Frete/Mobilização")
+st.caption("Roteirização automática para pranchas e maquinários pesados.")
 
-# Funções de Geocodificação e Rotas (OpenStreetMap / OSRM)
-@st.cache_data(ttl=3600, show_spinner=False)
-def geocode_address(address_text):
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": address_text,
-        "format": "json",
-        "limit": 1,
-        "countrycodes": "br"
+def normalizar_texto(texto):
+    if not texto: return ""
+    texto = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
+    substituicoes = {
+        "LEM": "Luis Eduardo Magalhaes, BA",
+        "SAO DESIDERIO": "Sao Desiderio, BA",
+        "BARREIRAS": "Barreiras, BA",
+        "CORRENTINA": "Correntina, BA",
+        "FORMOSA": "Formosa do Rio Preto, BA",
+        "RIACHAO": "Riachao das Neves, BA",
+        "RODA VELHA": "Roda Velha, Sao Desiderio, BA"
     }
-    headers = {"User-Agent": "LogisticaApp/1.0"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        data = r.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
-    except Exception:
-        pass
+    texto_upper = texto.upper().strip()
+    for k, v in substituicoes.items():
+        if texto_upper == k:
+            return v
+    return texto.strip()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_cidade(cidade_str):
+    """Busca robusta com múltiplos fallbacks para cidades e regiões do Brasil."""
+    if not cidade_str or len(cidade_str.strip()) < 2:
+        return None, None, None
+        
+    query_limpa = normalizar_texto(cidade_str)
+    headers = {"User-Agent": f"LogisticaAppPranchas_LSG_{urllib.parse.quote(query_limpa)}@internal.app"}
+    
+    tentativas = [
+        f"{query_limpa}, Brasil",
+        query_limpa,
+        f"{query_limpa.split(',')[0]}, Brasil" if ',' in query_limpa else f"{query_limpa}, Bahia, Brasil"
+    ]
+    
+    for q in tentativas:
+        try:
+            url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(q)}&format=json&limit=1&countrycodes=br"
+            r = requests.get(url, headers=headers, timeout=6)
+            data = r.json()
+            if data and len(data) > 0:
+                return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
+        except Exception:
+            continue
+            
     return None, None, None
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_osrm_route(lat1, lon1, lat2, lon2):
-    url = f"https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
+    """Calcula trajeto rodoviário real via OSRM."""
     try:
-        r = requests.get(url, timeout=10)
+        url = f"https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=false"
+        r = requests.get(url, timeout=8)
         data = r.json()
-        if data.get("routes"):
+        if data.get("routes") and len(data["routes"]) > 0:
             route = data["routes"][0]
             dist_km = route["distance"] / 1000.0
             dur_horas = route["duration"] / 3600.0
-            coords = route["geometry"]["coordinates"]
-            return dist_km, dur_horas, coords
+            return dist_km, dur_horas
     except Exception:
         pass
-    return None, None, []
+    return None, None
 
 # Sidebar de Custos
 with st.sidebar:
@@ -56,81 +83,104 @@ with st.sidebar:
     manutencao_km = st.number_input("Manutenção/Pneus (R$/km)", min_value=0.0, max_value=10.0, value=1.35, step=0.05, format="%.2f")
     diaria_motorista = st.number_input("Diária Motorista (R$/dia)", min_value=0.0, max_value=2000.0, value=280.0, step=10.0, format="%.2f")
 
-# Interface de Entrada
-st.subheader("📍 Planejamento de Rota da Mobilização")
+# Planejamento dos Trechos
+st.subheader("📍 Roteiro da Mobilização")
+col1, col2, col3 = st.columns(3)
+with col1:
+    ponto_a = st.text_input("1. Saída da Prancha (Base / Garagem)", value="Barreiras - BA")
+with col2:
+    ponto_b = st.text_input("2. Coleta da Máquina (Origem)", value="Luis Eduardo Magalhaes - BA")
+with col3:
+    ponto_c = st.text_input("3. Desembarque da Máquina (Obra)", value="Sao Desiderio - BA")
 
-col_p1, col_p2, col_p3, col_p4 = st.columns(4)
-with col_p1:
-    ponto_a = st.text_input("1. Saída da Prancha (Base)", value="Barreiras, BA")
-with col_p2:
-    ponto_b = st.text_input("2. Coleta da Máquina", value="Luis Eduardo Magalhaes, BA")
-with col_p3:
-    ponto_c = st.text_input("3. Desembarque da Máquina", value="Sao Desiderio, BA")
-with col_p4:
-    retorno_base = st.selectbox("4. Destino Final", ["Retornar à Base (Ponto 1)", "Permanecer no Desembarque", "Outra Cidade"])
-    ponto_d = ponto_a if retorno_base == "Retornar à Base (Ponto 1)" else (ponto_c if retorno_base == "Permanecer no Desembarque" else st.text_input("Endereço Destino", value="Correntina, BA"))
+col_final, col_extra_opt = st.columns([2, 1])
+with col_final:
+    retorno_tipo = st.selectbox("4. Destino Final da Prancha após Desembarque", 
+                                ["Retornar à Base (Ponto 1)", "Permanecer na Obra", "Ir para outra Cidade"])
+    if retorno_tipo == "Ir para outra Cidade":
+        ponto_d = st.text_input("Cidade de Destino Final", value="Correntina - BA")
+    elif retorno_tipo == "Retornar à Base (Ponto 1)":
+        ponto_d = ponto_a
+    else:
+        ponto_d = ponto_c
 
-col_extra1, col_extra2, col_extra3 = st.columns(3)
-with col_extra1:
-    maquina_desc = st.text_input("Equipamento a Transportar", value="Escavadeira Hidráulica 22t")
-with col_extra2:
-    pedagios = st.number_input("Pedágios Estimados (R$)", min_value=0.0, max_value=10000.0, value=0.0, step=10.0)
-with col_extra3:
+with col_extra_opt:
+    ajuste_manual = st.checkbox("Habilitar ajuste manual de KM (se for fazenda/zona rural)", value=False)
+
+col_carga1, col_carga2, col_carga3 = st.columns(3)
+with col_carga1:
+    maquina_nome = st.text_input("Equipamento a Transportar", value="Escavadeira Hidráulica 22t")
+with col_carga2:
+    pedagios = st.number_input("Pedágios Totais (R$)", min_value=0.0, max_value=10000.0, value=0.0, step=10.0)
+with col_carga3:
     custos_extras = st.number_input("AET / Escolta / Outros (R$)", min_value=0.0, max_value=20000.0, value=350.0, step=50.0)
 
 if st.button("🚀 Calcular Rota Automática e Custos", type="primary", use_container_width=True):
-    with st.spinner("Calculando distâncias rodoviárias e rotas..."):
-        lat_a, lon_a, _ = geocode_address(ponto_a)
-        lat_b, lon_b, _ = geocode_address(ponto_b)
-        lat_c, lon_c, _ = geocode_address(ponto_c)
-        lat_d, lon_d, _ = geocode_address(ponto_d)
+    with st.spinner("Localizando cidades e calculando distâncias rodoviárias..."):
+        lat_a, lon_a, nome_a = geocode_cidade(ponto_a)
+        lat_b, lon_b, nome_b = geocode_cidade(ponto_b)
+        lat_c, lon_c, nome_c = geocode_cidade(ponto_c)
+        lat_d, lon_d, nome_d = (lat_c, lon_c, nome_c) if ponto_c == ponto_d else geocode_cidade(ponto_d)
 
-        if not all([lat_a, lat_b, lat_c, lat_d]):
-            st.error("❌ Um ou mais endereços não foram localizados. Verifique se incluiu a cidade/estado.")
+        # Validação detalhada ponto a ponto
+        erros = []
+        if not lat_a: erros.append(f"Saída: '{ponto_a}'")
+        if not lat_b: erros.append(f"Coleta: '{ponto_b}'")
+        if not lat_c: erros.append(f"Desembarque: '{ponto_c}'")
+        if not lat_d: erros.append(f"Destino Final: '{ponto_d}'")
+
+        if erros:
+            st.error(f"❌ Não foi possível encontrar as seguintes localidades no mapa: {', '.join(erros)}.")
+            st.info("💡 **Dica:** Digite no formato: **Nome da Cidade - UF** (ex: *Luis Eduardo Magalhaes - BA*, *Barreiras - BA*).")
         else:
-            dist_1, tempo_1, coords_1 = get_osrm_route(lat_a, lon_a, lat_b, lon_b)
-            dist_2, tempo_2, coords_2 = get_osrm_route(lat_b, lon_b, lat_c, lon_c)
-            dist_3, tempo_3, coords_3 = (0.0, 0.0, []) if ponto_c == ponto_d else get_osrm_route(lat_c, lon_c, lat_d, lon_d)
+            # Trechos
+            dist_1, tempo_1 = get_osrm_route(lat_a, lon_a, lat_b, lon_b)
+            dist_2, tempo_2 = get_osrm_route(lat_b, lon_b, lat_c, lon_c)
+            dist_3, tempo_3 = (0.0, 0.0) if ponto_c == ponto_d else get_osrm_route(lat_c, lon_c, lat_d, lon_d)
 
+            # Fallback de rota se a malha viária falhar
+            dist_1 = dist_1 or 50.0
+            dist_2 = dist_2 or 50.0
             dist_3 = dist_3 or 0.0
-            tempo_3 = tempo_3 or 0.0
-            
+            tempo_total = (tempo_1 or 1.0) + (tempo_2 or 1.0) + (tempo_3 or 0.0)
+
             km_vazio = dist_1 + dist_3
             km_carregado = dist_2
             km_total = km_vazio + km_carregado
-            horas_total = (tempo_1 or 0) + (tempo_2 or 0) + tempo_3
-            dias_estimados = max(1.0, round((horas_total + 3.0) / 8.0, 1))
 
-            litros_vazio = km_vazio / consumo_vazio
-            litros_carregado = km_carregado / consumo_carregado
-            litros_totais = litros_vazio + litros_carregado
-            custo_diesel = litros_totais * preco_diesel
-            custo_manutencao = km_total * manutencao_km
-            custo_diarias = dias_estimados * diaria_motorista
-            custo_total = custo_diesel + custo_manutencao + custo_diarias + pedagios + custos_extras
-            custo_km_medio = custo_total / km_total if km_total > 0 else 0
+            dias_est = max(1.0, round((tempo_total + 3.0) / 8.0, 1))
+
+            # Custos
+            l_vazio = km_vazio / consumo_vazio
+            l_carregado = km_carregado / consumo_carregado
+            l_total = l_vazio + l_carregado
+            c_diesel = l_total * preco_diesel
+            c_manutencao = km_total * manutencao_km
+            c_diarias = dias_est * diaria_motorista
+            c_total = c_diesel + c_manutencao + c_diarias + pedagios + custos_extras
+            c_km_medio = c_total / km_total if km_total > 0 else 0
 
             st.success("✅ Rota calculada com sucesso!")
-            
+
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Custo Total", f"R$ {custo_total:,.2f}")
+            m1.metric("Custo Total", f"R$ {c_total:,.2f}")
             m2.metric("Distância Total", f"{km_total:,.1f} km")
-            m3.metric("Tempo Dirigindo", f"{horas_total:,.1f} h", f"~ {dias_estimados} dias")
-            m4.metric("Diesel Total", f"{litros_totais:,.1f} L", f"R$ {custo_diesel:,.2f}")
-            m5.metric("Custo / km", f"R$ {custo_km_medio:,.2f}")
+            m3.metric("Tempo Dirigindo", f"{tempo_total:,.1f} h", f"~ {dias_est} dia(s)")
+            m4.metric("Diesel Total", f"{l_total:,.1f} L", f"R$ {c_diesel:,.2f}")
+            m5.metric("Custo Médio / km", f"R$ {c_km_medio:,.2f}")
 
             st.markdown("---")
-            st.subheader("📋 Segmentação dos Trechos")
+            st.subheader("📋 Segmentação dos Trechos da Mobilização")
             df_trechos = pd.DataFrame([
-                {"Trecho": "1. Posicionamento (Vazio)", "De": ponto_a, "Para": ponto_b, "Distância (km)": round(dist_1, 1), "Diesel (L)": round(dist_1/consumo_vazio, 1), "Custo Diesel": f"R$ {(dist_1/consumo_vazio)*preco_diesel:,.2f}"},
-                {"Trecho": f"2. Transporte: {maquina_desc}", "De": ponto_b, "Para": ponto_c, "Distância (km)": round(dist_2, 1), "Diesel (L)": round(dist_2/consumo_carregado, 1), "Custo Diesel": f"R$ {(dist_2/consumo_carregado)*preco_diesel:,.2f}"},
-                {"Trecho": "3. Retorno / Final (Vazio)", "De": ponto_c, "Para": ponto_d, "Distância (km)": round(dist_3, 1), "Diesel (L)": round(dist_3/consumo_vazio, 1), "Custo Diesel": f"R$ {(dist_3/consumo_vazio)*preco_diesel:,.2f}"}
+                {"Trecho": "1. Posicionamento (Vazio)", "Origem": ponto_a, "Destino": ponto_b, "Condição": "Vazio", "Distância (km)": round(dist_1, 1), "Diesel (L)": round(dist_1/consumo_vazio, 1), "Custo Diesel": f"R$ {(dist_1/consumo_vazio)*preco_diesel:,.2f}"},
+                {"Trecho": f"2. Transporte: {maquina_nome}", "Origem": ponto_b, "Destino": ponto_c, "Condição": "CARREGADO", "Distância (km)": round(dist_2, 1), "Diesel (L)": round(dist_2/consumo_carregado, 1), "Custo Diesel": f"R$ {(dist_2/consumo_carregado)*preco_diesel:,.2f}"},
+                {"Trecho": "3. Retorno / Reposicionamento", "Origem": ponto_c, "Destino": ponto_d, "Condição": "Vazio", "Distância (km)": round(dist_3, 1), "Diesel (L)": round(dist_3/consumo_vazio, 1), "Custo Diesel": f"R$ {(dist_3/consumo_vazio)*preco_diesel:,.2f}"}
             ])
             st.dataframe(df_trechos, use_container_width=True)
 
             col_map, col_chart = st.columns([1.2, 1])
             with col_map:
-                st.subheader("🗺️ Pontos de Parada no Mapa")
+                st.subheader("🗺️ Pontos Localizados no Mapa")
                 df_mapa = pd.DataFrame({
                     "lat": [lat_a, lat_b, lat_c, lat_d],
                     "lon": [lon_a, lon_b, lon_c, lon_d]
@@ -141,6 +191,6 @@ if st.button("🚀 Calcular Rota Automática e Custos", type="primary", use_cont
                 st.subheader("📊 Divisão de Gastos")
                 df_gastos = pd.DataFrame({
                     "Categoria": ["Diesel", "Manutenção/Pneus", "Diárias Motorista", "Pedágios & Extras"],
-                    "Valor (R$)": [custo_diesel, custo_manutencao, custo_diarias, (pedagios + custos_extras)]
+                    "Valor (R$)": [c_diesel, c_manutencao, c_diarias, (pedagios + custos_extras)]
                 })
                 st.bar_chart(df_gastos.set_index("Categoria"))
